@@ -518,7 +518,10 @@ def set_q_n(model, hyd_type, is_conv=True, qc_flag=False, inv_rel_var=None, use_
             method_str = "Microphysics logic"
             data_frac = model.ds[model.strat_frac_names[hyd_type]].astype('float64').values
         N_profs = model.ds[model.N_field[hyd_type]].astype('float64').values
-        N_profs = N_profs / data_frac
+        # Clear cells have zero fraction, so their in-cloud number is zero.
+        # Avoid 0/0 (or positive/0) without altering numbers in cloudy cells.
+        N_profs = np.divide(N_profs, data_frac, out=np.zeros_like(N_profs),
+                            where=data_frac > 0)
         sub_data_frac = model.ds[frac_fieldname].values
         N_profs = np.tile(N_profs, (model.num_subcolumns, 1, 1))
         N_profs = np.where(sub_data_frac, N_profs, 0)
@@ -547,8 +550,7 @@ def set_q_n(model, hyd_type, is_conv=True, qc_flag=False, inv_rel_var=None, use_
             dims=model.ds[frac_fieldname].dims)
         if not is_conv:
             model.ds[n_name] = xr.DataArray(
-                np.tile(model.ds[model.N_field[hyd_type]].astype('float64').values / data_frac, (1, 1, 1)),
-                                            dims=model.ds[frac_fieldname].dims)
+                N_profs, dims=model.ds[frac_fieldname].dims)
     else:
         if qc_flag:
 
