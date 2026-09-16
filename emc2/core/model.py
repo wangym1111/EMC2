@@ -118,6 +118,8 @@ class Model():
           1. "MG2", "MG", "Morrison" - essentially treated the same.
           2. "NSSL"
           3. "P3"
+          4. "Thompson" - MPAS bundled Thompson–Eidhammer implementation.
+          5. "TEMPO" - MPAS TEMPO saved-state reconstruction, including hail-aware graupel.
     rad_scheme_family: str
         Radiation scheme family. Many models share the same radiation scheme or bulk scattering LUT
         ancestor (inc. same PSD parameters, ice habit description, etc.). This parameters determines
@@ -2100,3 +2102,7 @@ class TestHalfAndHalf(Model):
         self._calc_air_density()  # calculate air density with input T and p fields
         self.height_dim = "height"
         self.time_dim = "time"
+
+
+# Keep model.MPAS consistent with the public paths of the existing adapters.
+from .mpas import MPAS  # noqa: E402,F401

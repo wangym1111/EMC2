@@ -22,6 +22,8 @@ if hasattr(np, 'trapezoid'):
 else:
     trapz_func = np.trapz
 from .psd import calc_velocity_nssl, calc_and_set_psd_params
+from ..core.thompson import snow_distribution
+from ..core.tempo import tempo_graupel_velocity, TEMPO_REFERENCE_DENSITY
 from ..core.instrument import ureg, quantity
 
 
@@ -620,7 +622,11 @@ def calc_radar_micro(instrument, model, z_values, atm_ext, OD_from_sfc=True,
 
         num_subcolumns = model.num_subcolumns
         rhoe = None
-        if model.mcphys_scheme == "nssl":
+        if model.mcphys_scheme == 'TEMPO' and hyd_type == 'gr' and model.hail_aware:
+            rhoe = model.ds['mpas_graupel_density'].values
+            v_tmp = np.zeros_like(p_diam)  # evaluated per column/level below
+            calc_kws = None
+        elif model.mcphys_scheme == "nssl":
             rhoe = model.Rho_hyd[hyd_type]
             if rhoe == 'variable':
                 rhoe = model.ds[model.variable_density[hyd_type]].values[:]
@@ -672,6 +678,10 @@ def calc_radar_micro(instrument, model, z_values, atm_ext, OD_from_sfc=True,
 
         # Microphysics scheme-specific air density correction of terminal velocity
         rhoa_corr = np.ones(model.ds["rho_a"].shape)  # by default, no correction is applied
+        if model.mcphys_scheme.lower() == 'thompson':
+            rhoa_corr = (101325. / (287.05 * 298.) / model.ds['rho_a'].values)**.5
+        elif model.mcphys_scheme.lower() == 'tempo':
+            rhoa_corr = (TEMPO_REFERENCE_DENSITY / model.ds['rho_a'].values)**.5
         if hyd_type in model.Vd_rhoa_scaling_ref.keys():
             if model.Vd_rhoa_scaling_ref[hyd_type] is not None:
                 rhoa_corr = (model.Vd_rhoa_scaling_ref[hyd_type] / model.ds["rho_a"].values) ** 0.54
@@ -830,7 +840,11 @@ def calc_radar_micro(instrument, model, z_values, atm_ext, OD_from_sfc=True,
                 beta_p = instrument.mie_table[hyd_type]["beta_p"].values
                 alpha_p = instrument.mie_table[hyd_type]["alpha_p"].values
             rhoe = None
-            if model.mcphys_scheme == "nssl":
+            if model.mcphys_scheme == 'TEMPO' and hyd_type == 'gr' and model.hail_aware:
+                rhoe = model.ds['mpas_graupel_density'].values
+                v_tmp = np.zeros_like(p_diam)
+                calc_kws = None
+            elif model.mcphys_scheme == "nssl":
                 rhoe = model.Rho_hyd[hyd_type]
                 if rhoe == 'variable':
                     rhoe = model.ds[model.variable_density[hyd_type]].values[:]
@@ -1168,7 +1182,7 @@ def _calc_sigma_d_tot_cl(tt, N_0, lambdas, mu, instrument,
         N_D = N_0_tmp[:, None] * p_diam[None, :] ** mu_tmp[:, None] * np.exp(-lambda_tmp[:, None] * p_diam[None, :])
         Calc_tmp = instrument.mie_table[hyd_type]["beta_p"].values[None, :] * N_D
         moment_denom = trapz_func(Calc_tmp, x=p_diam, axis=1).astype('float64')
-        if mcphys_scheme.lower() in ["mg2", "mg", "morrison", "nssl", "p3"]:  # power-law velocity schemes for liquid
+        if mcphys_scheme.lower() in ["mg2", "mg", "morrison", "nssl", "p3", "thompson", "tempo"]:  # power-law velocity schemes for liquid
             if model is not None:
                 vel_a_arr, vel_b_arr, _ = model._get_terminal_velocity_params(hyd_type, p_diam_array=p_diam)
                 # Handle both scalar (Quantity) and piecewise (ndarray) cases
@@ -1232,12 +1246,16 @@ def _calc_sigma_d_tot(tt, num_subcolumns, v_tmp, N_0, lambdas, mu,
                 N_D.append(N_0_tmp[i] * np.exp(-lambda_tmp[i] * p_diam))  # exponential PSD (mu=0)
                 #N_D.append(N_0_tmp[i] * p_diam ** mu * np.exp(-lambda_tmp[i] * p_diam))
         N_D = np.stack(N_D, axis=1).astype('float64')
+        if mcphys_scheme.lower() in ('thompson', 'tempo') and hyd_type == 'pi':
+            N_D = snow_distribution(p_diam[:, None], N_0_tmp[None, :], lambda_tmp[None, :])
         Calc_tmp = beta_p[None, :] * N_D.T
         moment_denom = trapz_func(Calc_tmp, x=p_diam, axis=1).astype('float64')
         v_use = v_tmp
         if rhoe is not None:
             if mcphys_scheme.lower() in ["nssl"]:  # NSSL parameterization for fall velocity
                 v_use = calc_velocity_nssl(rhoe[tt, k], p_diam, hyd_type)
+            elif mcphys_scheme.lower() == 'tempo' and hyd_type == 'gr':
+                v_use = -tempo_graupel_velocity(p_diam, rhoe[tt, k])
         v_use = v_use * rhoa_corr_single
         Calc_tmp2 = (v_use - vd_tot[:, tt, k, None]) ** 2 * Calc_tmp.astype('float64')
         Calc_tmp2 = trapz_func(Calc_tmp2, x=p_diam, axis=1)
@@ -1335,6 +1353,8 @@ def _calculate_other_observables(tt, total_hydrometeor, N_0, lambdas, mu,
             N_0_k = N_0[:, tt, k]
             lambda_k = lambdas[:, tt, k]
             N_D = N_0_k[:, None] * np.exp(-lambda_k[:, None] * p_diam[None, :])  # exponential PSD (mu=0)
+            if mcphys_scheme.lower() in ('thompson', 'tempo') and hyd_type == 'pi':
+                N_D = snow_distribution(p_diam[None, :], N_0_k[:, None], lambda_k[:, None])
         Calc_tmp = beta_p[None, :] * N_D
         tmp_od = alpha_p[None, :] * N_D
         tmp_od = trapz_func(tmp_od, x=p_diam, axis=1)
@@ -1353,6 +1373,8 @@ def _calculate_other_observables(tt, total_hydrometeor, N_0, lambdas, mu,
         if rhoe is not None:
             if mcphys_scheme.lower() in ["nssl"]:  # NSSL parameterization for fall velocity
                 v_tmp = calc_velocity_nssl(rhoe[tt, k], p_diam, hyd_type)
+            elif mcphys_scheme.lower() == 'tempo' and hyd_type == 'gr':
+                v_tmp = -tempo_graupel_velocity(p_diam, rhoe[tt, k])
         v_use = v_tmp * rhoa_corr_single
         Calc_tmp2 = Calc_tmp * v_use
         V_d_numer = trapz_func(Calc_tmp2, axis=1, x=p_diam)

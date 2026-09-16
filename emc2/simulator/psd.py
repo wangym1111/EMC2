@@ -3,6 +3,51 @@ import numpy as np
 
 from scipy.special import gamma
 from ..core.instrument import ureg, quantity
+from ..core.thompson import cloud_shape, snow_parameters
+from ..core.tempo import tempo_graupel_intercept
+
+
+def calc_thompson_psd(model, hyd_type, is_conv=False, **kwargs):
+    """Thompson PSD parameters using kg/m3 and particles/m3 internally.
+
+    Snow stores the Field two-gamma amplitude and M2/M3 in N_0/lambda;
+    evaluate it with snow_distribution, not a single exponential.
+    """
+    if is_conv:
+        raise ValueError('Thompson PSDs require resolved (stratiform) fields')
+    q = model.ds[f'strat_q_subcolumns_{hyd_type}'] * model.ds['rho_a']
+    n = model.ds[f'strat_n_subcolumns_{hyd_type}'] * 1.e6
+    valid = (q > 0) & (n > 0)
+    tempo = model.mcphys_scheme.lower() == 'tempo'
+    if hyd_type == 'pi':
+        n0, slope = snow_parameters(q, model.ds[model.T_field], tempo=tempo)
+        mu = xr.zeros_like(q)
+    else:
+        mu = cloud_shape(n) if hyd_type == 'cl' else xr.zeros_like(q)
+        if model.Rho_hyd[hyd_type] == 'variable':
+            density = model.ds[model.variable_density[hyd_type]]
+        else:
+            density = model.Rho_hyd[hyd_type].magnitude
+        if hyd_type == 'gr' and not getattr(model, 'hail_aware', False):
+            n0 = (tempo_graupel_intercept(q) if tempo else
+                  model.ds['mpas_graupel_n0'].broadcast_like(q))
+            slope = (np.pi*density*n0/q.where(valid))**.25
+        else:
+            slope = (np.pi*density/6.*n*gamma(mu+4.) /
+                     (q.where(valid)*gamma(mu+1.)))**(1./3.)
+            n0 = n*slope**(mu+1.)/gamma(mu+1.)
+    # Clear subcolumns must have zero PSD even at levels with cloudy neighbors.
+    result = xr.Dataset({'N_0': n0.where(valid, 0.).transpose(*q.dims),
+                         'lambda': slope.where(valid, 1.).transpose(*q.dims),
+                         'mu': mu.where(valid, 0.).transpose(*q.dims)})
+    result['lambda'].attrs['units'] = 'm^-1'
+    result['mu'].attrs['units'] = '1'
+    result['N_0'].attrs['units'] = 'm^-(4+mu)'
+    result.attrs['distribution'] = 'Field two-gamma snow' if hyd_type == 'pi' else 'gamma'
+    # Existing radar/lidar routines remove these scratch fields after integration.
+    for name in ('N_0', 'lambda', 'mu'):
+        model.ds[name] = result[name]
+    return result
 
 
 def calc_velocity_nssl(dmax, rhoe, hyd_type):
@@ -171,6 +216,8 @@ def calc_and_set_psd_params(model, hyd_type, **kwargs):
         Containing the calculated PSD parameter fields such as "N_0", "lambda", and "mu".
 
     """
+    if model.mcphys_scheme.lower() in ('thompson', 'tempo'):
+        return calc_thompson_psd(model, hyd_type, **kwargs)
     if hyd_type in ["cl", "pl"]:  # liquid classes
         if model.mcphys_scheme.lower() in ["mg2", "mg", "morrison", "nssl", "p3"]:
             fits_ds = calc_mu_lambda(model, hyd_type, **kwargs).ds

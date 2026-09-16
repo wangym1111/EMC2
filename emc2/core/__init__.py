@@ -32,6 +32,7 @@ constants used by EMC^2 are also stored in this module.
     model.CESM2
     model.ModelE
     model.WRF
+    model.MPAS
     model.DHARMA
     model.TestConvection
     model.TestAllStratiform
@@ -49,3 +50,4 @@ from . import instruments
 from .instrument import Instrument
 from . import model
 from .model import Model
+from .mpas import MPAS

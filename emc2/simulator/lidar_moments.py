@@ -1,5 +1,6 @@
 import xarray as xr
 import numpy as np
+from ..core.thompson import snow_distribution
 import dask.bag as db
 from concurrent.futures import ProcessPoolExecutor
 import os
@@ -443,7 +444,7 @@ def calc_lidar_bulk(instrument, model, is_conv, p_values, z_values, OD_from_sfc=
             rho_b = instrument.rho_i  # bulk ice
             rho_hyd = model.Rho_hyd[hyd_type]
             if rho_hyd == 'variable':
-                rho_hyd = model.ds[model.variable_density[hyd_type]].values
+                rho_hyd = model.ds[model.variable_density[hyd_type]].values * ureg.kg / ureg.m**3
             if model.fluffy is None:
                 re_array = model.ds[re_fields[hyd_type]].values[None, :, :]
             else:
@@ -935,6 +936,8 @@ def _calc_strat_lidar_properties(tt, N_0, lambdas, mu, p_diam, total_hydrometeor
             lambda_k = lambdas[:, tt, k]
             mu_k = mu[:, tt, k]
             N_D = N_0_k[:, None] * p_diam[None, :] ** mu_k[:, None] * np.exp(-lambda_k[:, None] * p_diam[None, :])
+            if mcphys_scheme.lower() in ('thompson', 'tempo') and hyd_type == 'pi':
+                N_D = snow_distribution(p_diam[None, :], N_0_k[:, None], lambda_k[:, None])
 
         beta_p_strat[:, k] = trapz_func(beta_p[None, :] * N_D, x=D, axis=1).astype('float64')
         alpha_p_strat[:, k] = trapz_func(alpha_p[None, :] * N_D, x=D, axis=1).astype('float64')
