@@ -625,7 +625,8 @@ def calc_radar_micro(instrument, model, z_values, atm_ext, OD_from_sfc=True,
         if model.mcphys_scheme == 'TEMPO' and hyd_type == 'gr' and model.hail_aware:
             rhoe = model.ds['mpas_graupel_density'].values
             v_tmp = np.zeros_like(p_diam)  # evaluated per column/level below
-            calc_kws = None
+            calc_kws = ({'tempo_velocity_scale': model.ds['mpas_graupel_velocity_scale'].values}
+                        if 'mpas_graupel_velocity_scale' in model.ds else None)
         elif model.mcphys_scheme == "nssl":
             rhoe = model.Rho_hyd[hyd_type]
             if rhoe == 'variable':
@@ -843,7 +844,8 @@ def calc_radar_micro(instrument, model, z_values, atm_ext, OD_from_sfc=True,
             if model.mcphys_scheme == 'TEMPO' and hyd_type == 'gr' and model.hail_aware:
                 rhoe = model.ds['mpas_graupel_density'].values
                 v_tmp = np.zeros_like(p_diam)
-                calc_kws = None
+                calc_kws = ({'tempo_velocity_scale': model.ds['mpas_graupel_velocity_scale'].values}
+                            if 'mpas_graupel_velocity_scale' in model.ds else None)
             elif model.mcphys_scheme == "nssl":
                 rhoe = model.Rho_hyd[hyd_type]
                 if rhoe == 'variable':
@@ -1256,6 +1258,8 @@ def _calc_sigma_d_tot(tt, num_subcolumns, v_tmp, N_0, lambdas, mu,
                 v_use = calc_velocity_nssl(rhoe[tt, k], p_diam, hyd_type)
             elif mcphys_scheme.lower() == 'tempo' and hyd_type == 'gr':
                 v_use = -tempo_graupel_velocity(p_diam, rhoe[tt, k])
+                if calc_kws is not None:
+                    v_use *= calc_kws['tempo_velocity_scale'][tt, k]
         v_use = v_use * rhoa_corr_single
         Calc_tmp2 = (v_use - vd_tot[:, tt, k, None]) ** 2 * Calc_tmp.astype('float64')
         Calc_tmp2 = trapz_func(Calc_tmp2, x=p_diam, axis=1)
@@ -1375,6 +1379,8 @@ def _calculate_other_observables(tt, total_hydrometeor, N_0, lambdas, mu,
                 v_tmp = calc_velocity_nssl(rhoe[tt, k], p_diam, hyd_type)
             elif mcphys_scheme.lower() == 'tempo' and hyd_type == 'gr':
                 v_tmp = -tempo_graupel_velocity(p_diam, rhoe[tt, k])
+                if calc_kws is not None:
+                    v_tmp *= calc_kws['tempo_velocity_scale'][tt, k]
         v_use = v_tmp * rhoa_corr_single
         Calc_tmp2 = Calc_tmp * v_use
         V_d_numer = trapz_func(Calc_tmp2, axis=1, x=p_diam)

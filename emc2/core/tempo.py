@@ -7,7 +7,23 @@ prognostic hail fields. All functions here use SI density and mass content.
 import numpy as np
 
 TEMPO_REVISION = '17c952bdfc0adcd1059aa404b80a34397a775b3c'
+TEMPO_MPAS_831_REVISION = '9adf9ef2827104640125f0c322e1218fce74e94c'
 TEMPO_REFERENCE_DENSITY = 101325. / (287.04 * 298.)
+
+
+def tempo_legacy_velocity_scale(temperature, air_density):
+    """9adf9ef / 17c952b graupel velocity ratio, before the shared rho factor.
+
+    The earlier graupel_sedimentation uses local air density and dynamic
+    viscosity in afall. Both revisions additionally apply sqrt(rho_not/rho).
+    """
+    tc = temperature - 273.15
+    viscosity = (1.718 + .0049*tc - np.where(tc < 0, 1.2e-5*tc**2, 0.))*1.e-5
+    if np.any(viscosity <= 0):
+        raise ValueError('Temperature is outside the TEMPO viscosity relation')
+    exponent = .54698726
+    return (.47244157 * (.504843467198652*TEMPO_REFERENCE_DENSITY/air_density)**exponent
+            * viscosity**(1.-2.*exponent))
 
 
 def tempo_graupel_density(mass_mixing_ratio, volume_mixing_ratio):

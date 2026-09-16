@@ -1,4 +1,4 @@
-"""MPAS-Atmosphere adapter for the bundled Thompson–Eidhammer scheme."""
+"""MPAS-Atmosphere adapter for Thompson–Eidhammer and TEMPO output."""
 import numpy as np
 from re import sub
 import xarray as xr
@@ -7,8 +7,55 @@ from scipy.special import gamma
 from .model import Model
 from .instrument import ureg
 from .thompson import cloud_shape, snow_parameters, snow_number, graupel_intercept
-from .tempo import (TEMPO_REVISION, tempo_graupel_density, tempo_graupel_intercept,
-                    tempo_graupel_velocity)
+from .tempo import (TEMPO_REVISION, TEMPO_MPAS_831_REVISION, tempo_graupel_density,
+                    tempo_graupel_intercept, tempo_graupel_velocity,
+                    tempo_legacy_velocity_scale)
+
+
+def _select_columns(source, cell_indices, time_range, names):
+    """Subset lazily, excluding mesh topology before loading or stacking."""
+    allowed = {'Time', 'nCells', 'nVertLevels', 'nVertLevelsP1'}
+    xtime = names.get('xtime', 'xtime')
+    keep = [k for k, v in source.data_vars.items()
+            if set(v.dims) <= allowed or k == xtime]
+    ds = source[keep].copy(deep=False)
+    if 'nCells' in ds.dims and 'nCells' not in ds.coords:
+        ds = ds.assign_coords(nCells=np.arange(ds.sizes['nCells']))
+    if cell_indices is not None:
+        ds = ds.isel(nCells=np.atleast_1d(cell_indices))
+    if 'Time' not in ds.dims:
+        ds = ds.expand_dims(Time=[0])
+    if 'nVertLevels' not in ds.dims:
+        raise ValueError('MPAS requires the nVertLevels dimension')
+    # xtime retains exact seconds when numeric Time was written as float32.
+    if xtime in ds:
+        values = ds[xtime].values
+        if values.ndim == 2:
+            values = [b''.join(row) if row.dtype.kind == 'S' else ''.join(row)
+                      for row in values]
+        strings = [(v.decode() if isinstance(v, bytes) else str(v))
+                   .strip('\x00 ').replace('_', 'T') for v in np.atleast_1d(values)]
+        ds = ds.assign_coords(Time=np.asarray(strings, dtype='datetime64[ns]'))
+    elif 'Time' in ds.coords and not np.issubdtype(ds.Time.dtype, np.datetime64):
+        ds = xr.decode_cf(ds)
+    if time_range is not None:
+        if 'Time' not in ds.coords or not np.issubdtype(ds.Time.dtype, np.datetime64):
+            raise ValueError('time_range requires datetime Time or MPAS xtime')
+        start, end = np.asarray(time_range, dtype='datetime64[ns]')
+        ds = ds.isel(Time=(ds.Time >= start) & (ds.Time < end))
+    if any(ds.sizes[d] == 0 for d in ('Time', 'nVertLevels')) or ds.sizes.get('nCells', 1) == 0:
+        raise ValueError('MPAS selection contains no columns or levels')
+    return ds
+
+
+def _config_flag(attrs, key, default):
+    value = attrs.get(key)
+    if value is None:
+        return default
+    value = str(value).strip().upper()
+    if value not in ('YES', 'NO'):
+        raise ValueError(f'MPAS {key} must be YES or NO')
+    return value == 'YES'
 
 
 class MPAS(Model):
@@ -20,7 +67,7 @@ class MPAS(Model):
         Native output with Time, nCells and nVertLevels dimensions. A selected
         single column is also accepted. See the MPAS section of usage/model.
     time_range : pair of datetime-like, optional
-        Inclusive start and exclusive end, decoded from xtime if necessary.
+        Inclusive start and exclusive end. Prefer exact xtime to numeric Time.
     cell_indices : integer or sequence of integers, optional
         Select mesh cells before loading and stacking.
     variable_names : dict, optional
@@ -28,25 +75,31 @@ class MPAS(Model):
         No WRF-style names are guessed. Input units must remain meaningful.
     unit_overrides : dict, optional
         Input field name to unit string, for files with missing/wrong metadata.
-    aerosol_aware : bool
-        Default True requires prognostic nc. False requires nc or an explicit
+    aerosol_aware : bool, optional
+        Infer from config_tempo_aerosolaware for TEMPO, otherwise True.
+        True requires prognostic nc. False requires nc or an explicit
         cloud_number (cm-3); aerosols never substitute for activated droplets.
     cloud_number : float, optional
         Prescribed droplets in cm-3, only for non-aerosol-aware Thompson.
     q_hyd_truncation_cutoff : float
         Nonnegative mixing-ratio threshold in kg kg-1 (default 1e-14).
-    mcphys_scheme : {'Thompson', 'TEMPO'}
-        Default preserves the bundled MPAS Thompson implementation.
+    mcphys_scheme : {'Thompson', 'TEMPO'}, optional
+        Infer from config_microp_scheme when supplied; otherwise Thompson.
     hail_aware : bool, optional
-        TEMPO defaults to True, requiring ng and volg. False diagnoses graupel
+        Infer from config_tempo_hailaware; TEMPO otherwise defaults to True,
+        requiring ng and volg. False diagnoses graupel
         number with TEMPO's single-moment relation. The actual volume field
         must have an explicit unit_overrides entry because MPAS metadata can
         conflict with TEMPO's L/kg convention. Hail is saved within graupel.
+    tempo_revision : str, optional
+        Supported source hash (full or seven characters): 17c952b or 9adf9ef.
+        MPAS git_version cecd3ad5 selects 9adf9ef; otherwise use 17c952b.
+        Explicit settings override attributes copied from other files.
 
     Notes
     -----
     This targets MPAS's module_mp_thompson.F with fixed-density graupel,
-    unless mcphys_scheme='TEMPO' selects the saved-state TEMPO formulation.
+    or the saved-state TEMPO formulation selected by argument or file metadata.
     Native aerosol fields
     are retained but aerosol optical scattering/activation is not simulated.
     ModelE optical tables are an explicit approximation; no Thompson-specific
@@ -56,14 +109,46 @@ class MPAS(Model):
     """
 
     def __init__(self, file_path, time_range=None, cell_indices=None,
-                 variable_names=None, unit_overrides=None, aerosol_aware=True,
+                 variable_names=None, unit_overrides=None, aerosol_aware=None,
                  cloud_number=None, q_hyd_truncation_cutoff=1.e-14,
-                 mcphys_scheme='Thompson', hail_aware=None):
+                 mcphys_scheme=None, hail_aware=None, tempo_revision=None):
         super().__init__()
+        names = dict(variable_names or {})
+        units = dict(unit_overrides or {})
+        if isinstance(file_path, xr.Dataset):
+            ds = _select_columns(file_path, cell_indices, time_range, names)
+        else:
+            with xr.open_dataset(file_path, decode_times=False) as source:
+                ds = _select_columns(source, cell_indices, time_range, names).load()
+        if mcphys_scheme is None:
+            native_scheme = str(ds.attrs.get('config_microp_scheme', 'mp_thompson')).strip().lower()
+            schemes = {'mp_thompson': 'Thompson', 'mp_tempo': 'TEMPO'}
+            if native_scheme not in schemes:
+                raise ValueError(f'Unsupported MPAS config_microp_scheme {native_scheme!r}; '
+                                 'set mcphys_scheme explicitly only for compatible output')
+            mcphys_scheme = schemes[native_scheme]
         if mcphys_scheme.lower() not in ('thompson', 'tempo'):
             raise ValueError('mcphys_scheme must be Thompson or TEMPO')
         tempo = mcphys_scheme.lower() == 'tempo'
-        self.hail_aware = tempo if hail_aware is None else hail_aware
+        if tempo_revision is not None and not tempo:
+            raise ValueError('tempo_revision requires mcphys_scheme="TEMPO"')
+        if tempo:
+            if tempo_revision is None:
+                tempo_revision = (TEMPO_MPAS_831_REVISION
+                                  if str(ds.attrs.get('git_version', '')).startswith('cecd3ad5')
+                                  else TEMPO_REVISION)
+            supported = (TEMPO_REVISION, TEMPO_MPAS_831_REVISION)
+            matches = [r for r in supported if tempo_revision in (r, r[:7])]
+            if not matches:
+                raise ValueError('Unsupported tempo_revision; use 17c952b or 9adf9ef')
+            self.tempo_revision = matches[0]
+        self.hail_aware = (_config_flag(ds.attrs, 'config_tempo_hailaware', True)
+                           if tempo else False) if hail_aware is None else hail_aware
+        if aerosol_aware is None:
+            aerosol_aware = (_config_flag(ds.attrs, 'config_tempo_aerosolaware', True)
+                             if tempo else True)
+        if not isinstance(aerosol_aware, (bool, np.bool_)):
+            raise ValueError('aerosol_aware must be boolean')
         if not isinstance(self.hail_aware, (bool, np.bool_)):
             raise ValueError('hail_aware must be boolean')
         if self.hail_aware and not tempo:
@@ -73,8 +158,6 @@ class MPAS(Model):
         if cloud_number is not None and (aerosol_aware or
                 not np.isfinite(cloud_number) or cloud_number <= 0):
             raise ValueError('cloud_number must be positive and requires aerosol_aware=False')
-        names = dict(variable_names or {})
-        units = dict(unit_overrides or {})
         self.model_name = 'MPAS'
         self.mcphys_scheme = 'TEMPO' if tempo else 'Thompson'
         self.rad_scheme_family = 'ModelE'
@@ -104,38 +187,11 @@ class MPAS(Model):
         if self.hail_aware:
             # Reference-density metadata; radar evaluates the actual local density.
             self.vel_param_a['gr'] = float(tempo_graupel_velocity(1., 500.))
+            if self.tempo_revision == TEMPO_MPAS_831_REVISION:
+                self.vel_param_a['gr'] *= float(tempo_legacy_velocity_scale(
+                    298., 101325./(287.04*298.)))
             self.vel_param_b['gr'] = (3.*.54698726-1.)*ureg.dimensionless
         self._add_vel_units()
-
-        if isinstance(file_path, xr.Dataset):
-            ds = file_path.copy(deep=False)
-            if cell_indices is not None:
-                ds = ds.isel(nCells=np.atleast_1d(cell_indices))
-        else:
-            with xr.open_dataset(file_path) as source:
-                if cell_indices is not None:
-                    source = source.isel(nCells=np.atleast_1d(cell_indices))
-                ds = source.load()
-        if 'Time' not in ds.dims:
-            ds = ds.expand_dims(Time=[0])
-        if 'nVertLevels' not in ds.dims:
-            raise ValueError('MPAS requires the nVertLevels dimension')
-        if 'xtime' in ds and not ('Time' in ds.coords and
-                np.issubdtype(ds.Time.dtype, np.datetime64)):
-            values = ds.xtime.values
-            if values.ndim == 2:
-                values = [b''.join(row) if row.dtype.kind == 'S' else ''.join(row)
-                          for row in values]
-            strings = [(v.decode() if isinstance(v, bytes) else str(v)).strip('\x00 ').replace('_', 'T')
-                       for v in values]
-            ds = ds.assign_coords(Time=np.asarray(strings, dtype='datetime64[ns]'))
-        if time_range is not None:
-            if 'Time' not in ds.coords or not np.issubdtype(ds.Time.dtype, np.datetime64):
-                raise ValueError('time_range requires datetime Time or MPAS xtime')
-            start, end = np.asarray(time_range, dtype='datetime64[ns]')
-            ds = ds.isel(Time=(ds.Time >= start) & (ds.Time < end))
-        if any(ds.sizes[d] == 0 for d in ('Time', 'nVertLevels')) or ds.sizes.get('nCells', 1) == 0:
-            raise ValueError('MPAS selection contains no columns or levels')
 
         def field(key, target, default):
             name = names.get(key, key)
@@ -144,7 +200,7 @@ class MPAS(Model):
             arr = ds[name].astype('float64')
             unit = str(units.get(name, arr.attrs.get('units', default)))
             unit = unit.replace('nb', '').replace('#', '').replace('{', '').replace('}', '')
-            unit = unit.replace('m MSL', 'm').strip()
+            unit = unit.replace('m MSL', 'm').replace('unitless', 'dimensionless').strip()
             unit = sub(r'([A-Za-z]+)([-+]\d+)', r'\1**\2', unit)
             try:
                 factor = (1.*ureg(unit)).to(target).magnitude
@@ -179,11 +235,18 @@ class MPAS(Model):
                 theta = mass_grid(field('theta', 'K', 'K'))
             else:
                 theta = mass_grid(field('theta_m', 'K', 'K'))/(1.+template*461.6/287.)
-            temperature = theta * (pressure/1.e5)**(2./7.)
+            if names.get('exner', 'exner') in ds:
+                exner = mass_grid(field('exner', 'dimensionless', 'dimensionless'))
+                if bool((~np.isfinite(exner) | (exner <= 0)).any()):
+                    raise ValueError('MPAS exner must be finite and positive')
+            else:
+                exner = (pressure/1.e5)**(2./7.)
+            temperature = theta * exner
         if names.get('rho', 'rho') in ds:
             rho = mass_grid(field('rho', 'kg/m**3', 'kg/m**3'))
         else:
-            epsilon = 287.04/461.5 if tempo else .622
+            epsilon = (287.04/461.5 if tempo and self.tempo_revision == TEMPO_REVISION
+                       else .622)
             rho = pressure/(287.04*temperature*(1.+template/epsilon))
         for label, value in (('pressure', pressure), ('temperature', temperature), ('density', rho)):
             if bool((~np.isfinite(value) | (value <= 0)).any()):
@@ -193,6 +256,9 @@ class MPAS(Model):
         self.ds[self.p_field] = pressure*.01
         self.ds[self.T_field] = temperature
         self.ds['rho_a'] = rho
+        if tempo and self.hail_aware and self.tempo_revision == TEMPO_MPAS_831_REVISION:
+            self.ds['mpas_graupel_velocity_scale'] = tempo_legacy_velocity_scale(temperature, rho)
+            self.ds['mpas_graupel_velocity_scale'].attrs['units'] = '1'
         z = field('zgrid', 'm', 'm')
         if 'nVertLevelsP1' not in z.dims or z.sizes['nVertLevelsP1'] != ds.sizes['nVertLevels']+1:
             raise ValueError('zgrid must have nVertLevels+1 interfaces on nVertLevelsP1')
@@ -300,7 +366,7 @@ class MPAS(Model):
                              emc2_optics='ModelE lookup tables: approximate Thompson optics')
         if tempo:
             self.ds.attrs.update(emc2_mpas_microphysics='TEMPO saved-state PSD reconstruction',
-                                 emc2_tempo_revision=TEMPO_REVISION,
+                                 emc2_tempo_revision=self.tempo_revision,
                                  emc2_tempo_hail_aware=int(self.hail_aware))
         self.check_and_stack_time_lat_lon()
 

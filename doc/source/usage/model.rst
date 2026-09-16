@@ -7,9 +7,11 @@ MPAS Thompson–Eidhammer adapter
 
 ``emc2.core.model.MPAS`` (also ``emc2.core.MPAS``) accepts a native
 MPAS-Atmosphere NetCDF file or an ``xarray.Dataset``. It targets the
-fixed-density Thompson implementation bundled with MPAS, including its
-aerosol-aware extension by default. ``mcphys_scheme="TEMPO"`` selects the
-TEMPO saved-state reconstruction described below. The adapter does not
+fixed-density Thompson implementation bundled with MPAS and the TEMPO
+saved-state reconstruction described below. ``config_microp_scheme`` selects
+the scheme automatically when present (``mp_thompson`` or ``mp_tempo``).
+Without that attribute, Thompson remains the default. An explicit
+``mcphys_scheme="Thompson"`` or ``"TEMPO"`` overrides file attributes. The adapter does not
 implement arbitrary newer WRF variants or the CAM-MPAS physics suite.
 
 Example::
@@ -55,7 +57,7 @@ Input fields and units
      - Total pressure; alternatively pressure_base + pressure_p. EMC2 output is hPa.
    * - temperature
      - K
-     - Otherwise derived from dry theta and (p/100000)**(2/7), or from theta_m after removing its moisture factor.
+     - Otherwise dry theta times native exner (unitless), falling back to (p/100000)**(2/7) when exner is absent. theta_m is used after removing its moisture factor if theta is absent.
    * - rho
      - kg/m3
      - Dry-air density. Otherwise p / [287.04 T (1 + qv/0.622)], following Thompson's conversion.
@@ -69,11 +71,17 @@ Input fields and units
 Native ``Time, nCells, nVertLevels`` fields are required; already selected
 single columns without ``nCells`` are supported. ``zgrid`` uses
 ``nVertLevelsP1`` of length ``nVertLevels + 1``. Heights must increase upward.
-``xtime`` is decoded when no datetime ``Time`` coordinate exists. Time-range
+``xtime`` takes precedence over numeric or decoded ``Time`` because float32
+seconds since a distant epoch can lose seconds. Without ``xtime``, CF time
+units are decoded. Time-range
 selection is inclusive at the start and exclusive at the end. Multiple cells
 are stacked with time using EMC2's existing machinery and can be restored
-with ``model.unstack_time_lat_lon()``. Cell IDs and native aerosol/mesh fields
-are retained. Select cells before running on a large mesh to limit memory use.
+with ``model.unstack_time_lat_lon()``. Native cell indices, ``indexToCellID``,
+latitude/longitude, aerosol fields, and other column fields are retained.
+Variables on edge, vertex, soil, or other unrelated dimensions are excluded
+before loading and stacking. Cell/time selection also precedes loading.
+Select cells before running on a large mesh to limit memory use; loading
+every column of a 477,760-cell mesh is still expensive.
 
 ``variable_names={'nc': 'qnc'}`` explicitly maps alternate field names.
 ``unit_overrides={'qnc': 'cm^-3'}`` overrides metadata by actual field name.
@@ -152,7 +160,7 @@ serial radar/lidar integration without downloading model output.
 TEMPO mode
 ----------
 
-TEMPO is selected explicitly; existing Thompson calls retain their behavior::
+TEMPO can be selected explicitly, or inferred from ``config_microp_scheme``::
 
     model = emc2.core.model.MPAS(
         "history.nc", mcphys_scheme="TEMPO", cell_indices=[100],
@@ -163,18 +171,28 @@ TEMPO is selected explicitly; existing Thompson calls retain their behavior::
 
 The implementation targets `NCAR/TEMPO revision 17c952b
 <https://github.com/NCAR/TEMPO/tree/17c952bdfc0adcd1059aa404b80a34397a775b3c>`_.
-The revision is stored in dataset attributes. Aerosol-aware behavior still
+MPAS ``git_version="cecd3ad5"`` instead selects its pinned TEMPO revision
+``9adf9ef2827104640125f0c322e1218fce74e94c``. This earlier version uses local
+air density and temperature-dependent dynamic viscosity in hail-aware
+graupel fall speeds, and 0.622 for its fallback vapor/dry-gas ratio. The
+snow-moment and graupel density-bin relations used here match both versions.
+``tempo_revision="9adf9ef"`` or ``"17c952b"`` explicitly selects either
+implementation (full hashes also accepted); unknown explicit revisions fail.
+The selected revision is stored in dataset attributes. Aerosol-aware behavior still
 requires ``nc``; the adapter does not rerun aerosol activation or machine-learning
-droplet diagnostics. ``hail_aware`` defaults to True for TEMPO and False for
-the original Thompson mode. Set it to match the producing simulation.
+droplet diagnostics. For TEMPO, ``aerosol_aware`` and ``hail_aware`` infer
+``config_tempo_aerosolaware`` and ``config_tempo_hailaware`` (YES/NO), each
+defaulting to True when absent. Explicit boolean arguments override these
+attributes. Thompson defaults to aerosol-aware and fixed-density graupel.
 
 Hail-aware inputs and volume units
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 TEMPO uses the same five saved hydrometeor categories, plus required ``ng``
 (graupel/hail number per kg dry air) and ``volg`` (volume per kg dry air) in
-hail-aware mode. Its internal hail-hyperaware split is recombined into
-``qg/ng/volg`` before output. No independent prognostic ``qh`` or ``nh`` is
+hail-aware mode. In the newer revision, its internal hail-hyperaware split
+is recombined into ``qg/ng/volg`` before output; the older revision already
+uses one combined category. No independent prognostic ``qh`` or ``nh`` is
 assumed; in the inspected UFS-MPAS registry those fields belong to NSSL.
 
 **Explicit volume units are required.** TEMPO's calculations use L/kg, while
@@ -195,6 +213,48 @@ finite ``ng`` and volume. Clear cells may contain zero number and volume.
 ``hail_aware=False`` requires neither ``ng`` nor ``volg``. This mode diagnoses
 graupel using TEMPO's local single-moment intercept relation and its 1e2–1e6
 m-4 bounds, which differ from the older Thompson intercept calculation.
+
+Example: MPAS 8.3.1-noaa header
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For native output matching ``mpasout.2022-06-02_23.00.00``, with appended
+``zgrid`` from the invariant file::
+
+    model = emc2.core.MPAS(
+        "mpasout.2022-06-02_23.00.00.nc",
+        cell_indices=[0], unit_overrides={"volg": "L/kg"})
+
+This detects TEMPO and both awareness flags, uses ``nc/ni/nr/ng``, computes
+pressure from ``pressure_base + pressure_p``, temperature from ``theta *
+exner``, number per volume from dry ``rho``, and 59 mass-level heights from
+60 ``zgrid`` interfaces. The supplied ``re_cloud/re_ice/re_snow`` are used
+for the radiation-radius fields. Snow number is diagnosed; there is no
+separate hail number or hail mass field in this header.
+
+The L/kg override follows the exact MPAS source revision's direct
+``volg -> volg_p -> qb -> qb1d`` transfer and TEMPO's explicit L/kg
+calculations, despite the m3/kg Registry/header label. It assumes the volume
+values have not been converted in postprocessing. Use m3/kg if they have.
+
+The header's history records an appended invariant file and its global
+``core_name`` is ``init_atmosphere``. Such copied attributes can be stale.
+Confirm the producing run configuration and override ``mcphys_scheme``,
+``aerosol_aware``, ``hail_aware``, or ``tempo_revision`` if necessary; the
+adapter does not infer forecast time from ``config_start_time``.
+``cldfrac``, ``cldfrac_bl``, ``qc_bl`` and ``qi_bl`` remain native diagnostics;
+they do not change the resolved condensate or binary subcolumn fractions.
+``refl10cm`` is retained when present for comparison, not used as simulated
+radar reflectivity. ``rho_zz`` is not dry density and is never substituted
+for ``rho``.
+
+Sources for this header's revision:
+
+* `MPAS cecd3ad5 physics interface
+  <https://github.com/ufs-community/MPAS-Model/blob/cecd3ad51bf973396b08ac0dcb065e7a869c47ea/src/core_atmosphere/physics/mpas_atmphys_interface.F>`_
+* `MPAS cecd3ad5 microphysics driver
+  <https://github.com/ufs-community/MPAS-Model/blob/cecd3ad51bf973396b08ac0dcb065e7a869c47ea/src/core_atmosphere/physics/mpas_atmphys_driver_microphysics.F>`_
+* `TEMPO 9adf9ef volume checks and graupel sedimentation
+  <https://github.com/NCAR/TEMPO/blob/9adf9ef2827104640125f0c322e1218fce74e94c/src/module_mp_tempo_main.F90>`_
 
 TEMPO-specific physics and limits
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -166,5 +166,151 @@ class TestTEMPOIntegration(unittest.TestCase):
         self.assertTrue((models[0].ds.sub_col_Vd_gr_strat < 0).all())
 
 
+
+
+def header_dataset():
+    """Small numeric fixture with the schema of mpas.file.header (59 levels).
+
+    Values are synthetic; the supplied header contains no atmospheric samples.
+    """
+    ds = tempo_dataset().drop_vars(['temperature', 'pressure', 'zgrid'])
+    ds = ds.drop_dims('nVertLevelsP1')
+    ds = ds.isel(nVertLevels=np.zeros(59, dtype=int)).assign_coords(nVertLevels=np.arange(59))
+    ds = ds.drop_vars('nCells')  # native MPAS cells have no coordinate variable
+    for key, value, unit in [('theta', 300., 'K'), ('theta_m', 305., 'K'),
+                             ('exner', .9, 'unitless'), ('pressure_base', 80000., 'Pa'),
+                             ('pressure_p', 1000., 'Pa'), ('cldfrac', .5, 'unitless'),
+                             ('qc_bl', .002, 'kg kg^{-1}'), ('qi_bl', .001, 'kg kg^{-1}'),
+                             ('re_cloud', 10.e-6, 'm'), ('re_ice', 30.e-6, 'm'),
+                             ('re_snow', 150.e-6, 'm')]:
+        ds[key] = xr.full_like(ds.qv, value)
+        ds[key].attrs['units'] = unit
+    ds['zgrid'] = (('nCells', 'nVertLevelsP1'), np.tile(np.arange(60)*100., (2, 1)))
+    ds.zgrid.attrs['units'] = 'm MSL'
+    ds['latCell'] = ('nCells', [.6, .7])
+    ds.latCell.attrs['units'] = 'rad'
+    ds['indexToCellID'] = ('nCells', [101, 102])
+    ds['u'] = (('Time', 'nEdges', 'nVertLevels'), np.zeros((2, 7, 59)))
+    ds['soil_temperature'] = (('Time', 'nCells', 'nSoilLevels'), np.zeros((2, 2, 9)))
+    exact = ['2022-06-02_23:00:01', '2022-06-02_23:00:06']
+    ds['xtime'] = (('Time', 'StrLen'), np.array([list(t.ljust(64)) for t in exact], dtype='S1'))
+    dates = np.array([t.replace('_', 'T') for t in exact], dtype='datetime64[s]')
+    seconds = (dates - np.datetime64('2010-10-23')).astype('timedelta64[s]').astype(np.float32)
+    ds = ds.assign_coords(Time=seconds)
+    ds.Time.attrs['units'] = 'seconds since 2010-10-23 00:00:00'
+    ds.attrs.update(config_microp_scheme='mp_tempo', config_tempo_aerosolaware='YES',
+                    config_tempo_hailaware='YES', version='8.3.1-noaa', git_version='cecd3ad5')
+    return ds
+
+
+class TestMPASHeader(unittest.TestCase):
+    def test_header_thermodynamics_dimensions_and_selection(self):
+        ds = header_dataset()
+        original = ds.copy(deep=True)
+        model = MPAS(ds, cell_indices=1, unit_overrides={'volg': 'L/kg'},
+                     time_range=('2022-06-02T23:00:00', '2022-06-02T23:00:03'))
+        self.assertEqual(model.mcphys_scheme, 'TEMPO')
+        self.assertTrue(model.hail_aware and model.aerosol_aware)
+        self.assertEqual(model.tempo_revision[:7], '9adf9ef')
+        self.assertEqual(model.ds[model.T_field].shape, (1, 59))
+        np.testing.assert_allclose(model.ds[model.T_field], 270.)
+        np.testing.assert_allclose(model.ds[model.p_field], 810.)
+        np.testing.assert_allclose(model.ds[model.z_field][0], np.arange(59)*100.+50.)
+        np.testing.assert_allclose(model.ds[model.N_field['cl']], 80.)
+        np.testing.assert_allclose(model.ds[model.strat_re_fields['cl']], 10.)
+        np.testing.assert_allclose(model.ds[model.q_names_stratiform['cl']], 1.e-4)
+        self.assertEqual(int(model.ds.nCells), 1)
+        self.assertEqual(int(model.ds.indexToCellID), 102)
+        self.assertEqual(model.ds.Time.values[0], np.datetime64('2022-06-02T23:00:01'))
+        for name in ('nwfa', 'nifa', 'latCell', 'cldfrac', 'qc_bl'):
+            self.assertIn(name, model.ds)
+        for name in ('u', 'soil_temperature', 'nEdges', 'nSoilLevels'):
+            self.assertNotIn(name, model.ds)
+        xr.testing.assert_identical(ds, original)
+
+    def test_file_roundtrip_and_exact_xtime(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'mpasout.nc'
+            header_dataset().to_netcdf(path)
+            model = MPAS(path, cell_indices=[1], unit_overrides={'volg': 'L/kg'},
+                         time_range=('2022-06-02T23:00:05', '2022-06-02T23:00:07'))
+        self.assertEqual(model.ds.Time.values[0], np.datetime64('2022-06-02T23:00:06'))
+        np.testing.assert_allclose(model.ds[model.T_field], 270.)
+
+    def test_cf_time_without_xtime_and_datetime_precedence(self):
+        ds = header_dataset().drop_vars('xtime')
+        ds = ds.assign_coords(Time=[0., 60.])
+        ds.Time.attrs['units'] = 'seconds since 2022-06-02 23:00:00'
+        model = MPAS(ds, unit_overrides={'volg': 'L/kg'})
+        model.unstack_time_lat_lon(squeeze_single_dims=False)
+        np.testing.assert_array_equal(model.ds.Time.values,
+                                      np.array(['2022-06-02T23:00', '2022-06-02T23:01'], dtype='datetime64[ns]'))
+        ds = xr.decode_cf(header_dataset())
+        model = MPAS(ds, cell_indices=0, unit_overrides={'volg': 'L/kg'})
+        self.assertEqual(model.ds.Time.values[0], np.datetime64('2022-06-02T23:00:01'))
+
+    def test_configuration_overrides_and_validation(self):
+        ds = header_dataset().drop_vars(['ng', 'volg', 'nc'])
+        ds.attrs.update(config_tempo_hailaware='NO', config_tempo_aerosolaware='NO')
+        model = MPAS(ds, cloud_number=50.)
+        self.assertFalse(model.hail_aware or model.aerosol_aware)
+        np.testing.assert_allclose(model.ds[model.N_field['cl']], 50.)
+        ds.attrs['config_tempo_hailaware'] = 'invalid'
+        model = MPAS(ds, cloud_number=50., hail_aware=False, tempo_revision='17c952b')
+        self.assertEqual(model.tempo_revision[:7], '17c952b')
+        with self.assertRaisesRegex(ValueError, 'YES or NO'):
+            MPAS(ds, cloud_number=50.)
+        ds.attrs['config_microp_scheme'] = 'mp_nssl2m'
+        with self.assertRaisesRegex(ValueError, 'Unsupported MPAS'):
+            MPAS(ds)
+        model = MPAS(ds, mcphys_scheme='Thompson', aerosol_aware=False, cloud_number=50.)
+        self.assertEqual(model.mcphys_scheme, 'Thompson')
+        with self.assertRaisesRegex(ValueError, 'Unsupported tempo_revision'):
+            MPAS(header_dataset(), tempo_revision='unknown')
+
+    def test_aliases_exner_validation_and_volume_guard(self):
+        ds = header_dataset().rename(exner='pi_total', xtime='valid_time')
+        model = MPAS(ds, variable_names={'exner': 'pi_total', 'xtime': 'valid_time'},
+                     unit_overrides={'volg': 'L/kg'})
+        np.testing.assert_allclose(model.ds[model.T_field], 270.)
+        with self.assertRaisesRegex(ValueError, 'volume units'):
+            MPAS(header_dataset())
+        for invalid in (0., -1., np.nan):
+            ds = header_dataset()
+            ds.exner[:] = invalid
+            with self.assertRaisesRegex(ValueError, 'exner'):
+                MPAS(ds, unit_overrides={'volg': 'L/kg'})
+
+    def test_historical_velocity_matches_source(self):
+        from emc2.core.tempo import tempo_legacy_velocity_scale
+        temperature = np.array([250., 280.])
+        air_density = np.array([.8, 1.1])
+        diameter = np.array([.001, .003])
+        tc = temperature-273.15
+        viscosity = (1.718+.0049*tc-np.where(tc < 0., 1.2e-5*tc**2, 0.))*1.e-5
+        expected = (.47244157*(4.*400.*9.8/(3.*air_density))**.54698726
+                    * viscosity**(1.-2.*.54698726)*diameter**(3.*.54698726-1.))
+        actual = tempo_graupel_velocity(diameter, 400.)*tempo_legacy_velocity_scale(temperature, air_density)
+        np.testing.assert_allclose(actual, expected)
+
+    def test_header_radar_spectral_width_paths(self):
+        from emc2.core.instruments import KAZR
+        from emc2.simulator.main import make_simulated_data
+        models = []
+        for single_pass, revision in ((True, '9adf9ef'), (False, '9adf9ef'), (True, '17c952b')):
+            model = MPAS(header_dataset(), cell_indices=0, unit_overrides={'volg': 'L/kg'},
+                         tempo_revision=revision)
+            make_simulated_data(model, KAZR('nsa'), 1, use_rad_logic=False, parallel=False,
+                                single_pass_spectral_width=single_pass)
+            models.append(model)
+        field = 'sub_col_sigma_d_tot_strat'
+        np.testing.assert_allclose(models[0].ds[field], models[1].ds[field], rtol=1.e-6)
+        field = 'sub_col_Vd_gr_strat'
+        self.assertTrue(np.isfinite(models[0].ds[field]).all())
+        self.assertFalse(np.allclose(models[0].ds[field], models[2].ds[field]))
+
+
 if __name__ == '__main__':
     unittest.main()
